@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 antigravity-region-fix — адресный патч локального гейта доступности
-Antigravity CLI (agy) и бэкендов Antigravity для Linux и macOS.
+Antigravity CLI (agy) и бэкендов Antigravity для Linux, macOS и Windows.
 
 Что делает:
   * находит установленный agy и определяет его версию/архитектуру;
-  * проверяет, что бинарник — ELF или Mach-O (в т.ч. universal) известной
+  * проверяет, что бинарник — PE, ELF или Mach-O (в т.ч. universal) известной
     архитектуры, и что сигнатуры гейтов уникальны (0 совпадений или >1 —
     отказ без записи);
   * сохраняет проверенную резервную копию оригинала;
@@ -25,7 +25,6 @@ Antigravity CLI (agy) и бэкендов Antigravity для Linux и macOS.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import json
 import os
@@ -40,12 +39,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+if os.name != "nt":
+    import fcntl
+else:
+    import msvcrt
+
 TOOL = "antigravity-region-fix"
 TOOL_VERSION = "1.2.1"
 MANIFEST_SCHEMA = 1
 
 # --------------------------------------------------------------------------
-# ELF и Mach-O
+# PE, ELF и Mach-O
 # --------------------------------------------------------------------------
 
 EM_X86_64 = 0x3E
@@ -61,6 +65,9 @@ LC_SEGMENT_64 = 0x19
 VM_PROT_EXECUTE = 0x4
 CPU_TYPE_X86_64 = 0x01000007
 CPU_TYPE_ARM64 = 0x0100000C
+PE_MACHINE_X86_64 = 0x8664
+PE_MACHINE_ARM64 = 0xAA64
+IMAGE_SCN_MEM_EXECUTE = 0x20000000
 
 
 class PatchError(Exception):
@@ -129,7 +136,7 @@ def parse_elf(data: bytes) -> ElfInfo:
 
 @dataclass(frozen=True)
 class Slice:
-    """Один код-слайс: ELF целиком или одна архитектура внутри universal."""
+    """Один код-слайс: PE/ELF или одна архитектура внутри universal."""
     arch: str
     ranges: Tuple[Tuple[int, int], ...]
     base: int
@@ -138,7 +145,7 @@ class Slice:
 
 @dataclass(frozen=True)
 class BinaryInfo:
-    kind: str                       # "elf" | "macho"
+    kind: str                       # "pe" | "elf" | "macho"
     slices: Tuple[Slice, ...]
 
     @property
@@ -246,8 +253,72 @@ def _parse_macho(data: bytes) -> Optional[BinaryInfo]:
     return None
 
 
+def _parse_pe(data: bytes) -> Optional[BinaryInfo]:
+    if data[:2] != b"MZ":
+        return None
+    if len(data) < 0x40:
+        raise UnsupportedBinary("повреждённый заголовок PE")
+
+    pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+    if pe_offset < 0x40 or pe_offset + 24 > len(data):
+        raise UnsupportedBinary("заголовок PE выходит за пределы файла")
+    if data[pe_offset:pe_offset + 4] != b"PE\0\0":
+        raise UnsupportedBinary("неверная сигнатура PE")
+
+    machine, section_count = struct.unpack_from("<HH", data, pe_offset + 4)
+    optional_size = struct.unpack_from("<H", data, pe_offset + 20)[0]
+    if section_count <= 0 or section_count > 96 or optional_size < 2:
+        raise UnsupportedBinary("повреждённая таблица секций PE")
+
+    optional_offset = pe_offset + 24
+    if optional_offset + optional_size > len(data):
+        raise UnsupportedBinary("optional header PE выходит за пределы файла")
+    optional_magic = struct.unpack_from("<H", data, optional_offset)[0]
+    if machine in (PE_MACHINE_X86_64, PE_MACHINE_ARM64) and optional_magic != 0x20B:
+        raise UnsupportedBinary("для PE x64/arm64 требуется заголовок PE32+")
+
+    section_table = optional_offset + optional_size
+    section_table_end = section_table + section_count * 40
+    if section_table_end > len(data):
+        raise UnsupportedBinary("таблица секций PE выходит за пределы файла")
+
+    ranges: List[Tuple[int, int]] = []
+    for i in range(section_count):
+        offset = section_table + i * 40
+        raw_size, raw_offset = struct.unpack_from("<II", data, offset + 16)
+        characteristics = struct.unpack_from("<I", data, offset + 36)[0]
+        if not (characteristics & IMAGE_SCN_MEM_EXECUTE) or not raw_size:
+            continue
+        end = raw_offset + raw_size
+        if raw_offset < section_table_end or end > len(data):
+            raise UnsupportedBinary("исполняемая секция PE выходит за пределы файла")
+        ranges.append((raw_offset, end))
+
+    if not ranges:
+        raise UnsupportedBinary("в PE нет исполняемых секций")
+
+    ranges.sort()
+    merged: List[Tuple[int, int]] = []
+    for start, end in ranges:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+
+    arch = {
+        PE_MACHINE_X86_64: "x64",
+        PE_MACHINE_ARM64: "arm64",
+    }.get(machine, "unknown:0x%x" % machine)
+    sl = Slice(arch=arch, ranges=tuple(merged), base=0, size=len(data))
+    return BinaryInfo(kind="pe", slices=(sl,))
+
+
 def parse_binary(data: bytes) -> BinaryInfo:
-    """Определяет контейнер, архитектуру и исполняемые диапазоны."""
+    """Определяет PE, ELF или Mach-O, архитектуру и исполняемые диапазоны."""
+    pe = _parse_pe(data)
+    if pe is not None:
+        return pe
+
     if data[:4] == b"\x7fELF":
         elf = parse_elf(data)
         sl = Slice(arch=_arch_from_machine(elf.machine), ranges=elf.exec_ranges,
@@ -258,7 +329,7 @@ def parse_binary(data: bytes) -> BinaryInfo:
     if macho is not None:
         return macho
 
-    raise UnsupportedBinary("неизвестный формат: ожидался ELF или Mach-O")
+    raise UnsupportedBinary("неизвестный формат: ожидался PE, ELF или Mach-O")
 
 
 # --------------------------------------------------------------------------
@@ -541,7 +612,10 @@ def sha256_file(path: Path, chunk: int = 8 * 1024 * 1024) -> str:
 
 
 def state_dir() -> Path:
-    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
     path = Path(base) / TOOL
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -605,8 +679,68 @@ def write_target(path: Path, data: bytes, mode: int) -> None:
 
 
 def is_binary_running(path: Path) -> List[int]:
-    real = os.path.realpath(path)
+    real = os.path.normcase(os.path.realpath(path))
     pids: List[int] = []
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        class ProcessEntry(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
+        kernel32.Process32FirstW.restype = wintypes.BOOL
+        kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
+        kernel32.Process32NextW.restype = wintypes.BOOL
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)
+        ]
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+        if snapshot == ctypes.c_void_p(-1).value:
+            return pids
+        try:
+            entry = ProcessEntry()
+            entry.dwSize = ctypes.sizeof(entry)
+            found = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+            while found:
+                pid = int(entry.th32ProcessID)
+                if pid != os.getpid():
+                    process = kernel32.OpenProcess(0x1000, False, pid)
+                    if process:
+                        try:
+                            image = ctypes.create_unicode_buffer(32768)
+                            size = wintypes.DWORD(len(image))
+                            if kernel32.QueryFullProcessImageNameW(
+                                process, 0, image, ctypes.byref(size)
+                            ) and os.path.normcase(os.path.realpath(image.value)) == real:
+                                pids.append(pid)
+                        finally:
+                            kernel32.CloseHandle(process)
+                found = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snapshot)
+        return pids
+
     proc = Path("/proc")
     if not proc.is_dir():
         return pids
@@ -623,7 +757,7 @@ def is_binary_running(path: Path) -> List[int]:
             continue
         if target.endswith(" (deleted)"):
             target = target[: -len(" (deleted)")]
-        if os.path.realpath(target) == real:
+        if os.path.normcase(os.path.realpath(target)) == real:
             pids.append(pid)
     return pids
 
@@ -684,7 +818,8 @@ def detect_version(path: Path, data: Optional[bytes] = None) -> str:
     if from_asar:
         return from_asar
 
-    if path.name != "agy":
+    cli_name = "agy.exe" if os.name == "nt" else "agy"
+    if os.path.normcase(path.name) != cli_name:
         # language_server и прочие бэкенды не понимают `-p`/`--version`
         return "unknown"
 
@@ -735,22 +870,29 @@ def app_targets() -> List[Path]:
 
 def default_targets(all_targets: bool, include_apps: bool = False) -> List[Path]:
     candidates: List[Path] = []
-    which = shutil.which("agy")
+    which = shutil.which("agy.exe" if os.name == "nt" else "agy")
     if which:
         candidates.append(Path(which))
     home = Path.home()
-    candidates.append(home / ".local" / "bin" / "agy")
-    if sys.platform == "darwin":
-        candidates.append(Path("/usr/local/bin/agy"))
-        candidates.append(Path("/opt/homebrew/bin/agy"))
-    if all_targets or include_apps:
-        candidates.extend(app_targets())
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            candidates.append(Path(local_app_data) / "agy" / "bin" / "agy.exe")
+        if all_targets or include_apps:
+            candidates.append(home / ".gemini" / "bin" / "agy.exe")
+    else:
+        candidates.append(home / ".local" / "bin" / "agy")
+        if sys.platform == "darwin":
+            candidates.append(Path("/usr/local/bin/agy"))
+            candidates.append(Path("/opt/homebrew/bin/agy"))
+        if all_targets or include_apps:
+            candidates.extend(app_targets())
     out: List[Path] = []
     seen = set()
     for c in candidates:
         if not c.exists() or not c.is_file():
             continue
-        real = os.path.realpath(c)
+        real = os.path.normcase(os.path.realpath(c))
         if real in seen:
             continue
         seen.add(real)
@@ -820,6 +962,8 @@ def inspect(path: Path) -> Inspection:
 
 def ensure_writable(path: Path) -> None:
     if not os.access(str(path.parent), os.W_OK) or not os.access(str(path), os.W_OK):
+        if os.name == "nt":
+            raise PatchError("нет прав на запись в %s. Проверьте права учётной записи Windows." % path)
         raise PatchError(
             "нет прав на запись в %s. Запустите через sudo или исправьте владельца." % path
         )
@@ -1272,7 +1416,7 @@ def print_target_header(insp: Inspection) -> None:
 def cmd_status(args: argparse.Namespace) -> int:
     targets = resolve(args)
     if not targets:
-        err("agy не найден. Укажите --path /путь/к/agy")
+        err("agy не найден. Укажите путь к файлу через --path.")
         return 2
     for path in targets:
         try:
@@ -1398,7 +1542,8 @@ def cmd_test(args: argparse.Namespace) -> int:
         err("agy не найден")
         return 2
     path = targets[0]
-    if path.name != "agy":
+    cli_name = "agy.exe" if os.name == "nt" else "agy"
+    if os.path.normcase(path.name) != cli_name:
         err("режим -p есть только у agy; для %s доступна команда status/verify" % path.name)
         return 2
     insp = inspect(path)
@@ -1554,9 +1699,17 @@ class _Lock:
         self.fh = None
 
     def __enter__(self) -> "_Lock":
-        self.fh = open(self.path, "w")
+        self.fh = open(self.path, "a+b")
         try:
-            fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if os.name == "nt":
+                self.fh.seek(0, os.SEEK_END)
+                if self.fh.tell() == 0:
+                    self.fh.write(b"\0")
+                    self.fh.flush()
+                self.fh.seek(0)
+                msvcrt.locking(self.fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             err("другой экземпляр %s уже работает" % TOOL)
             raise SystemExit(3)
@@ -1564,14 +1717,18 @@ class _Lock:
 
     def __exit__(self, *exc: object) -> None:
         if self.fh:
-            fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
+            if os.name == "nt":
+                self.fh.seek(0)
+                msvcrt.locking(self.fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
             self.fh.close()
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog=TOOL,
-        description="Локальный патч регионального гейта Antigravity CLI (agy).",
+        description="Локальный патч регионального гейта Antigravity CLI (agy/agy.exe).",
     )
     p.add_argument("--path", action="append", metavar="FILE",
                    help="путь к agy (можно повторять); по умолчанию ищется в PATH")
@@ -1591,7 +1748,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = p.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("status", help="показать состояние agy и сигнатур")
+    sub.add_parser("status", help="показать состояние agy и найденных сигнатур")
     sub.add_parser("verify", help="проверить, что патч на месте")
     sub.add_parser("patch", help="применить патч")
     r = sub.add_parser("restore", help="восстановить оригинал из резервной копии")

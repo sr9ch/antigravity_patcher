@@ -82,13 +82,17 @@ class GateScanTests(unittest.TestCase):
 
     def test_parser_on_real_binary_if_present(self):
         """Разбор настоящего agy, если он есть в системе (иначе тест пропускается)."""
-        candidates = [shutil.which("agy"), str(Path.home() / ".local/bin/agy"),
+        candidates = [shutil.which("agy.exe"), shutil.which("agy"),
+                      str(Path.home() / ".local/bin/agy"),
                       str(Path.home() / ".gemini/bin/agy")]
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            candidates.append(str(Path(local_app_data) / "agy" / "bin" / "agy.exe"))
         existing = [Path(p) for p in candidates if p and Path(p).is_file()]
         if not existing:
             self.skipTest("agy не установлен")
         info = fix.parse_binary(existing[0].read_bytes())
-        self.assertIn(info.kind, ("elf", "macho"))
+        self.assertIn(info.kind, ("pe", "elf", "macho"))
         self.assertTrue(info.arch)
         self.assertTrue(all(s.ranges for s in info.slices))
 
