@@ -4,7 +4,7 @@
 Antigravity для Linux и macOS. Позволяет использовать уже авторизованный
 Google-аккаунт без VPN, прокси, смены DNS и смены региона аккаунта.
 
-Проверено на `agy 1.5.13` и `agy 1.5.14`, Fedora Linux 45, x86-64,
+Проверено на `agy 1.5.13`, `1.5.14` и `1.5.16`, Fedora Linux 45, x86-64,
 аккаунт с обычной consumer-авторизацией. Поддержка macOS (Mach-O, включая
 universal-бинарники) реализована и покрыта юнит-тестами, но на реальном Mac
 ещё не прогонялась — см. раздел 3.1.
@@ -142,6 +142,7 @@ cd ~/Проекты/antigravity-region-fix
 ./agy-region-fix test        # реальный запрос: agy -p "Reply with exactly OK"
 ./agy-region-fix doctor      # проверить каждую модель живым запросом
 ./agy-region-fix restore     # вернуть оригинальный бинарник
+./agy-region-fix autopatch install   # патчить самому после каждого обновления
 ```
 
 Полезное:
@@ -155,6 +156,9 @@ cd ~/Проекты/antigravity-region-fix
 ./agy-region-fix backups                  # список резервных копий
 ./agy-region-fix prune --keep 1           # удалить старые копии (каждая ~200 МБ)
 ./agy-region-fix gates                    # известные сигнатуры
+./agy-region-fix autopatch status          # как работает автопатч
+./agy-region-fix autopatch run             # одна проверка сейчас (без systemd)
+./agy-region-fix autopatch uninstall       # выключить автопатч
 ```
 
 ### Antigravity App и IDE
@@ -307,20 +311,81 @@ iOS/macOS-специфика: `agy` для macOS ставится тем же у
 
 ---
 
-## 5. Обновления CLI
+## 5. Обновления CLI и автопатч
 
-`agy` умеет обновляться сам (за время работы он обновился с 1.5.13 до 1.5.14).
-После обновления патч исчезает — это нормально. Действие:
+`agy` обновляется сам. Обновление скачивает новый бинарник целиком и
+подменяет файл — патч при этом исчезает, и CLI снова показывает экран
+«location is not supported». Это ожидаемо: патч живёт в байтах бинарника.
+
+### 5.1 Автопатч (включён)
+
+Патчер умеет переприменять себя после каждого обновления — через user-юниты
+systemd:
+
+```bash
+./agy-region-fix autopatch install     # включить (по умолчанию только CLI)
+./agy-region-fix --all autopatch install   # + бэкенды App/IDE
+./agy-region-fix autopatch status      # юниты, цели, последний запуск, журнал
+./agy-region-fix autopatch uninstall   # выключить (патч в файле остаётся)
+```
+
+Как это устроено:
+
+* `antigravity-region-fix.path` — `PathChanged=` + `PathModified=` на каждый
+  целевой файл. Срабатывает и на атомарную подмену (`rename`), и на запись на
+  месте, то есть на любой способ, которым апдейтер ставит новый бинарник.
+* `antigravity-region-fix.service` — oneshot, запускает
+  `agy-region-fix autopatch run`.
+* `antigravity-region-fix.timer` — страховка: проверка через 2 минуты после
+  входа и далее каждые 10 минут (`--interval` меняет период, `0` — только по
+  событию). Нужна, потому что событие inotify можно пропустить, если файл
+  пишется в момент, когда сервис уже занят.
+
+Что делает `autopatch run`:
+
+1. ждёт, пока размер/mtime/inode файла перестанут меняться (апдейтер пишет
+   250+ МБ, патчить недописанный файл нельзя);
+2. если версия уже пропатчена — молча выходит;
+3. если оригинал — патчит с `--force` (файл подменяется атомарно, запущенный
+   процесс продолжает работать со старой копией inode), проверяет хэш и
+   сигнатуры, оставляет максимум 3 резервные копии;
+4. если сигнатуры не найдены или состояние смешанное — **ничего не пишет**,
+   один раз пишет в журнал и показывает уведомление на десктопе: нужны свежие
+   сигнатуры в проекте. Повторные запуски с тем же хэшем не спамят.
+
+Журнал: `~/.local/share/antigravity-region-fix/autopatch.log` (ротация на
+512 КБ). Состояние: `autopatch.json` рядом. Запуск от systemd виден ещё и в
+`journalctl --user -u antigravity-region-fix.service`.
+
+Если хочется совсем без systemd — тот же `autopatch run` можно вызывать из
+cron (`*/10 * * * *`) или из своей обёртки; разницы в поведении нет.
+
+**macOS:** systemd там нет, поэтому `autopatch install` рассчитан на Linux.
+На Mac используйте тот же `autopatch run` из `launchd` (StartInterval 600)
+или из cron:
+
+```bash
+# crontab -e
+*/10 * * * * /путь/к/agy-region-fix autopatch run
+```
+
+Учтите, что после патча внутри `.app` на macOS ещё и переподписывается бандл
+(`codesign`), поэтому автопатч приложения требует, чтобы Terminal/launchd
+имел доступ к `codesign` и записи в бандл.
+
+### 5.2 Вручную
 
 ```bash
 ./agy-region-fix status      # увидит новую версию и состояние "original"
 ./agy-region-fix patch       # создаст бэкап новой версии и пропатчит её
 ```
 
-Сигнатуры не привязаны к абсолютным смещениям, поэтому работают и на 1.5.13, и на
-1.5.14 (смещения в них: `cli @ 0x9d09c09`, `hub @ 0x9639eea` — меняются от сборки
-к сборке). Если в новой версии код гейта перепишут, патчер откажется писать и
-вернёт код `2` — тогда нужно обновить сигнатуры в `GATES`.
+Сигнатуры не привязаны к абсолютным смещениям, поэтому работают на всех
+проверенных сборках: смещения меняются от сборки к сборке (1.5.13 —
+`cli @ 0x9d09c09`; 1.5.16 — `cli @ 0x9e2a889`, `hub @ 0x97234aa`), а
+сигнатуры ищутся по байтам. Если в новой версии код гейта перепишут,
+патчер откажется писать и вернёт код `2` (автопатч в этом случае пришлёт
+уведомление) — тогда нужно обновить сигнатуры в `GATES`.
 
 ---
 
@@ -370,10 +435,18 @@ antigravity_patcher/
 ├── NOTICE                      # атрибуция upstream
 ├── README.md
 ├── ci/github-actions-tests.yml # готовый CI (включается вручную, см. шапку файла)
-└── tests/test_patcher.py       # 22 юнит-теста
+└── tests/test_patcher.py       # 34 юнит-теста
 
-~/.local/share/antigravity-region-fix/backups/
-└── <имя>-<версия>-<sha12>.orig (+ .json)
+~/.local/share/antigravity-region-fix/
+├── backups/<имя>-<версия>-<sha12>.orig (+ .json)
+├── autopatch-run.sh    # обёртка для systemd (генерируется)
+├── autopatch.json      # цели и результат последнего запуска
+└── autopatch.log       # журнал автопатча
+
+~/.config/systemd/user/
+├── antigravity-region-fix.service
+├── antigravity-region-fix.path
+└── antigravity-region-fix.timer
 ```
 
 Запуск тестов: `make test` (или `python3 tests/test_patcher.py`).
@@ -417,7 +490,9 @@ tail -40 ~/.gemini/antigravity-cli/log/cli-*.log
 | `patch` вернул **3** | `agy` запущен | закройте CLI/IDE/приложение, повторите |
 | «нет прав на запись» | файл принадлежит root | `sudo ./agy-region-fix patch` или исправьте владельца |
 | Патч применён, но снова ошибка региона | пропатчен не тот файл | `which agy` и `./agy-region-fix status`; сверьте путь |
-| После обновления CLI всё сломалось | автообновление вернуло оригинал | `./agy-region-fix verify` → `patch` |
+| После обновления CLI всё сломалось | автообновление вернуло оригинал | есть автопатч: `autopatch status`; иначе `./agy-region-fix verify` → `patch` |
+| Автопатч не сработал | юнит не включён / файл вне списка целей | `./agy-region-fix autopatch status`, затем `autopatch install` заново |
+| Уведомление «нужны свежие сигнатуры» | новая версия с другим кодом гейта | ничего не записано; пришлите `status` + `agy --version` |
 | `400 FAILED_PRECONDITION`, «User location is not supported for the API use» **только на Gemini** | сервер режет это семейство по IP, остальные работают | `./agy-region-fix doctor` покажет, что отвечает; модель по умолчанию не меняется |
 | `400 FAILED_PRECONDITION` на всех моделях | **серверный** отказ по IP/аккаунту | локальным патчем не решается |
 | `403 PERMISSION_DENIED` | **серверные** права/регион аккаунта | локальным патчем не решается |
@@ -657,5 +732,5 @@ tail -50 ~/.gemini/antigravity-cli/log/cli-*.log
   в этом проекте.
 * Официальное: [google-antigravity/antigravity-cli](https://github.com/google-antigravity/antigravity-cli),
   [antigravity.google/docs](https://antigravity.google/docs/).
-* Версии, на которых сверены сигнатуры: CLI 1.5.13, 1.5.14 (Linux x86-64);
+* Версии, на которых сверены сигнатуры: CLI 1.5.13, 1.5.14, 1.5.16 (Linux x86-64);
   бэкенд IDE 1.5.2; приложение 2.29.0 (language_server).

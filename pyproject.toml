@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "antigravity-region-fix"
-version = "1.2.1"
+version = "1.3.0"
 description = "Локальный патч регионального гейта Antigravity CLI и приложения (Linux/macOS)"
 readme = "README.md"
 requires-python = ">=3.8"

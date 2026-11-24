@@ -30,6 +30,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import struct
 import subprocess
@@ -41,7 +42,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 TOOL = "antigravity-region-fix"
-TOOL_VERSION = "1.2.1"
+TOOL_VERSION = "1.3.0"
 MANIFEST_SCHEMA = 1
 
 # --------------------------------------------------------------------------
@@ -1366,9 +1367,13 @@ def cmd_backups(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_prune(args: argparse.Namespace) -> int:
+def prune_backups(keep: int) -> Tuple[int, int]:
+    """Удаляет старые резервные копии, оставляя `keep` последних.
+
+    Возвращает (удалено, всего было).
+    """
     manifests = sorted(backup_dir().glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    keep = max(0, args.keep)
+    keep = max(0, keep)
     removed = 0
     for mpath in manifests[keep:]:
         try:
@@ -1380,7 +1385,12 @@ def cmd_prune(args: argparse.Namespace) -> int:
             mpath.unlink()
         except (OSError, ValueError):
             continue
-    ok("удалено резервных копий: %d (оставлено %d)" % (removed, min(keep, len(manifests))))
+    return removed, len(manifests)
+
+
+def cmd_prune(args: argparse.Namespace) -> int:
+    removed, total = prune_backups(args.keep)
+    ok("удалено резервных копий: %d (оставлено %d)" % (removed, min(max(0, args.keep), total)))
     return 0
 
 
@@ -1538,6 +1548,456 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------
+# Автопатч: переприменять патч после самообновления agy (systemd --user)
+# --------------------------------------------------------------------------
+
+AUTOPATCH_SERVICE = "antigravity-region-fix.service"
+AUTOPATCH_PATH_UNIT = "antigravity-region-fix.path"
+AUTOPATCH_TIMER = "antigravity-region-fix.timer"
+AUTOPATCH_LOG_LIMIT = 512 * 1024
+AUTOPATCH_KEEP_BACKUPS = 3
+
+
+def config_home() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return Path(base)
+
+
+def systemd_user_dir() -> Path:
+    return config_home() / "systemd" / "user"
+
+
+def autopatch_runner() -> Path:
+    return state_dir() / "autopatch-run.sh"
+
+
+def autopatch_log_file() -> Path:
+    return state_dir() / "autopatch.log"
+
+
+def autopatch_record() -> Path:
+    return state_dir() / "autopatch.json"
+
+
+def load_autopatch_state() -> Dict[str, object]:
+    try:
+        data = json.loads(autopatch_record().read_text("utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_autopatch_state(state: Dict[str, object]) -> None:
+    text = json.dumps(state, ensure_ascii=False, indent=2) + "\n"
+    atomic_write(autopatch_record(), text.encode("utf-8"), 0o600)
+
+
+def autopatch_log(msg: str) -> None:
+    """Пишет строку в журнал автопатча (с ротацией при разрастании)."""
+    path = autopatch_log_file()
+    try:
+        if path.is_file() and path.stat().st_size > AUTOPATCH_LOG_LIMIT:
+            os.replace(path, path.parent / (path.name + ".1"))
+    except OSError:
+        pass
+    line = "%s  %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except OSError:
+        pass
+
+
+def notify_user(title: str, body: str) -> None:
+    """Показывает уведомление на десктопе, если он есть. Молча пропускает."""
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return
+    exe = shutil.which("notify-send")
+    if not exe:
+        return
+    try:
+        subprocess.run([exe, "-a", TOOL, title, body], check=False, timeout=10,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _sd_quote(value: str) -> str:
+    """Экранирует значение для systemd-юнита."""
+    value = value.replace("%", "%%")
+    if re.fullmatch(r"[A-Za-z0-9_@+=:,./-]+", value):
+        return value
+    return '"%s"' % value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def render_service_unit(runner: Path) -> str:
+    return "\n".join([
+        "[Unit]",
+        "Description=Re-apply the Antigravity region gate patch after agy updates",
+        "Documentation=https://github.com/sr9ch/antigravity_patcher",
+        "",
+        "[Service]",
+        "Type=oneshot",
+        "ExecStart=%s" % _sd_quote(str(runner)),
+        "Nice=10",
+        "",
+    ])
+
+
+def render_path_unit(targets: Sequence[Path]) -> str:
+    lines = [
+        "[Unit]",
+        "Description=Watch Antigravity binaries for updates",
+        "",
+        "[Path]",
+    ]
+    # PathChanged ловит атомарную замену файла (IN_CLOSE_WRITE / rename),
+    # PathModified — запись на месте.
+    lines += ["PathChanged=%s" % _sd_quote(str(t)) for t in targets]
+    lines += ["PathModified=%s" % _sd_quote(str(t)) for t in targets]
+    lines += ["Unit=%s" % AUTOPATCH_SERVICE, "", "[Install]", "WantedBy=paths.target", ""]
+    return "\n".join(lines)
+
+
+def render_timer_unit(minutes: int) -> str:
+    lines = [
+        "[Unit]",
+        "Description=Periodic check that the Antigravity patch is applied",
+        "",
+        "[Timer]",
+        "OnBootSec=2min",
+    ]
+    if minutes > 0:
+        lines.append("OnUnitActiveSec=%dmin" % minutes)
+    lines += [
+        "AccuracySec=30s",
+        "Unit=%s" % AUTOPATCH_SERVICE,
+        "",
+        "[Install]",
+        "WantedBy=timers.target",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def render_runner(module: Path, python: str) -> str:
+    return "\n".join([
+        "#!/bin/sh",
+        "# Сгенерировано %s autopatch install — файл перезаписывается." % TOOL,
+        "exec %s %s autopatch run" % (shlex.quote(python), shlex.quote(str(module))),
+        "",
+    ])
+
+
+def self_hint() -> str:
+    """Короткая команда для подсказок в выводе."""
+    module = Path(__file__).resolve()
+    launcher = module.parent / "agy-region-fix"
+    if launcher.is_file():
+        return shlex.quote(str(launcher))
+    return "%s %s" % (shlex.quote(sys.executable), shlex.quote(str(module)))
+
+
+def _systemctl(*args: str) -> Tuple[int, str]:
+    exe = shutil.which("systemctl")
+    if not exe:
+        return 127, "systemctl не найден"
+    try:
+        proc = subprocess.run([exe, "--user", *args], check=False, timeout=60,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, str(exc)
+    return proc.returncode, proc.stdout.decode("utf-8", "replace").strip()
+
+
+def wait_until_stable(path: Path, timeout: float = 20.0, settle: float = 1.0) -> bool:
+    """Ждёт, пока файл перестанет меняться.
+
+    Нужно потому, что PathModified срабатывает на первой же записи, а апдейтер
+    пишет 250+ МБ. Патчить недописанный файл нельзя.
+    """
+    deadline = time.monotonic() + timeout
+    prev: Optional[Tuple[int, int, int]] = None
+    stable_since: Optional[float] = None
+    while time.monotonic() < deadline:
+        try:
+            st = path.stat()
+            sig = (st.st_size, st.st_mtime_ns, st.st_ino)
+        except OSError:
+            time.sleep(0.2)
+            continue
+        now = time.monotonic()
+        if sig != prev:
+            prev = sig
+            stable_since = now
+        elif stable_since is not None and now - stable_since >= settle:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def autopatch_install(args: argparse.Namespace) -> int:
+    if sys.platform == "darwin":
+        err("autopatch ставит юниты systemd --user, а на macOS его нет")
+        print("на macOS используйте cron или launchd с той же командой:")
+        print("  */10 * * * * %s autopatch run" % self_hint())
+        return 2
+    targets = resolve(args)
+    if not targets:
+        err("agy не найден — нечего автоматически патчить")
+        return 2
+
+    module = Path(__file__).resolve()
+    runner = autopatch_runner()
+    atomic_write(runner, render_runner(module, sys.executable).encode("utf-8"), 0o755)
+
+    unit_dir = systemd_user_dir()
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    units = {
+        AUTOPATCH_SERVICE: render_service_unit(runner),
+        AUTOPATCH_PATH_UNIT: render_path_unit(targets),
+        AUTOPATCH_TIMER: render_timer_unit(args.interval),
+    }
+    for name, text in units.items():
+        atomic_write(unit_dir / name, text.encode("utf-8"), 0o644)
+    ok("юниты записаны в %s" % unit_dir)
+
+    rc, out = _systemctl("daemon-reload")
+    if rc != 0:
+        warn("systemctl --user daemon-reload не сработал: %s" % out)
+        warn("включите вручную: systemctl --user enable --now %s %s" %
+             (AUTOPATCH_PATH_UNIT, AUTOPATCH_TIMER))
+        return 2
+
+    started = []
+    for unit in (AUTOPATCH_PATH_UNIT, AUTOPATCH_TIMER):
+        rc, out = _systemctl("enable", "--now", unit)
+        if rc != 0:
+            warn("%s не включён: %s" % (unit, out))
+        else:
+            started.append(unit)
+
+    state = {
+        "installed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "targets": [str(t) for t in targets],
+        "interval_minutes": args.interval,
+        "module": str(module),
+        "python": sys.executable,
+        "unit_dir": str(unit_dir),
+        "failures": {},
+    }
+    save_autopatch_state(state)
+    autopatch_log("установлен автопатч: %s" % ", ".join(str(t) for t in targets))
+
+    ok("автопатч включён: %s" % ", ".join(started) if started else "юниты записаны")
+    print("  цели:    %s" % ", ".join(str(t) for t in targets))
+    print("  событие: изменение файла → мгновенный патч")
+    if args.interval > 0:
+        print("  таймер:  проверка каждые %d мин и через 2 мин после входа" % args.interval)
+    print("  журнал:  %s" % autopatch_log_file())
+    print("  статус:  %s autopatch status" % self_hint())
+    return 0
+
+
+def autopatch_uninstall(args: argparse.Namespace) -> int:
+    unit_dir = systemd_user_dir()
+    for unit in (AUTOPATCH_PATH_UNIT, AUTOPATCH_TIMER):
+        _systemctl("disable", "--now", unit)
+    _systemctl("daemon-reload")
+    removed = []
+    for name in (AUTOPATCH_SERVICE, AUTOPATCH_PATH_UNIT, AUTOPATCH_TIMER):
+        path = unit_dir / name
+        if path.exists():
+            try:
+                path.unlink()
+                removed.append(name)
+            except OSError as exc:
+                err("не удалось удалить %s: %s" % (path, exc))
+    runner = autopatch_runner()
+    if runner.exists():
+        try:
+            runner.unlink()
+        except OSError:
+            pass
+    _systemctl("reset-failed")
+    try:
+        autopatch_record().unlink()
+    except OSError:
+        pass
+    autopatch_log("автопатч выключен")
+    ok("автопатч выключен (удалено юнитов: %d)" % len(removed))
+    print("патч в бинарнике остался; снять его: %s restore" % self_hint())
+    return 0
+
+
+def autopatch_status(args: argparse.Namespace) -> int:
+    state = load_autopatch_state()
+    unit_dir = systemd_user_dir()
+    installed = any((unit_dir / n).is_file() for n in
+                    (AUTOPATCH_SERVICE, AUTOPATCH_PATH_UNIT, AUTOPATCH_TIMER))
+    if not installed and not state:
+        print("автопатч не установлен")
+        print("включить: %s autopatch install" % self_hint())
+        return 0
+
+    print("автопатч: %s" % ("установлен" if installed else "юниты удалены, запись осталась"))
+    if state.get("installed_at"):
+        print("  установлен: %s" % state.get("installed_at"))
+    for unit in (AUTOPATCH_PATH_UNIT, AUTOPATCH_TIMER):
+        _, enabled = _systemctl("is-enabled", unit)
+        _, active = _systemctl("is-active", unit)
+        print("  %-34s %s / %s" % (unit, enabled or "?", active or "?"))
+
+    targets = [Path(t) for t in (state.get("targets") or [])]
+    if targets:
+        print()
+        print("цели:")
+        for target in targets:
+            if not target.exists():
+                print("  %s — файла нет" % target)
+                continue
+            try:
+                insp = inspect(target)
+            except PatchError as exc:
+                print("  %s — %s" % (target, exc))
+                continue
+            label = {
+                "patched": "пропатчен",
+                "original": _c("не пропатчен", "33"),
+                "partial": _c("частично", "33"),
+                "broken": _c("повреждён", "31"),
+                "unsupported": _c("сигнатуры не найдены", "31"),
+            }.get(insp.overall, insp.overall)
+            print("  %s — %s %s" % (target, insp.version, label))
+
+    record = state.get("last") if isinstance(state.get("last"), dict) else None
+    if record:
+        print()
+        print("последний запуск: %s — %s" % (record.get("at"), record.get("message")))
+
+    log = autopatch_log_file()
+    if log.is_file():
+        lines = log.read_text("utf-8", "replace").strip().splitlines()
+        if lines:
+            print()
+            print("журнал (%s), последние строки:" % log)
+            for line in lines[-6:]:
+                print("  %s" % line)
+    return 0
+
+
+def autopatch_run(args: argparse.Namespace) -> int:
+    lock_path = state_dir() / ".lock"
+    handle = open(lock_path, "w")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        autopatch_log("пропуск: другой экземпляр уже работает")
+        return 0
+
+    state = load_autopatch_state()
+    failures = state.get("failures") if isinstance(state.get("failures"), dict) else {}
+
+    try:
+        targets = [Path(t) for t in (state.get("targets") or [])]
+        if not targets:
+            targets = resolve(args)
+
+        rc = 0
+        changed_any: List[str] = []
+        for path in targets:
+            if not path.exists():
+                continue
+            if not wait_until_stable(path):
+                autopatch_log("WARN %s: файл продолжает меняться, отложено" % path)
+                rc = max(rc, 1)
+                continue
+            try:
+                insp = inspect(path)
+            except PatchError as exc:
+                msg = "%s: %s" % (path, exc)
+                if failures.get(str(path)) != "error:" + msg:
+                    autopatch_log("ERROR " + msg)
+                    notify_user("Antigravity: патч не применён", msg)
+                    failures[str(path)] = "error:" + msg
+                rc = max(rc, 2)
+                continue
+
+            if insp.overall == "patched":
+                if args.verbose:
+                    autopatch_log("OK %s %s уже пропатчен" % (path, insp.version))
+                failures.pop(str(path), None)
+                continue
+
+            if insp.broken or not insp.present:
+                reason = ("смешанное состояние" if insp.broken
+                          else "сигнатуры гейта не найдены")
+                key = "%s:%s" % (reason, insp.sha256[:16])
+                if failures.get(str(path)) != key:
+                    msg = ("%s %s (%s): %s. Похоже на новую версию — нужны свежие "
+                           "сигнатуры в antigravity_patcher." %
+                           (path.name, insp.version, insp.arch, reason))
+                    autopatch_log("WARN " + msg)
+                    notify_user("Antigravity: нужны свежие сигнатуры", msg)
+                    failures[str(path)] = key
+                rc = max(rc, 2)
+                continue
+
+            ns = argparse.Namespace(force=True, json=False, dry_run=False,
+                                    no_resign=False, macos_disable_library_validation=False)
+            autopatch_log("обнаружена непропатченная версия %s (%s), патчу" %
+                          (insp.version, path))
+            try:
+                code = patch_one(path, ns)
+            except PatchError as exc:
+                code = 2
+                err(str(exc))
+            if code == 0:
+                failures.pop(str(path), None)
+                changed_any.append("%s %s" % (path.name, insp.version))
+                autopatch_log("OK %s %s пропатчен и проверен" % (path, insp.version))
+            else:
+                msg = "%s: патч не применился (код %d)" % (path, code)
+                autopatch_log("ERROR " + msg)
+                notify_user("Antigravity: патч не применён", msg)
+                failures[str(path)] = "code:%d" % code
+                rc = max(rc, code)
+
+        if changed_any:
+            removed, _ = prune_backups(AUTOPATCH_KEEP_BACKUPS)
+            if removed:
+                autopatch_log("старые резервные копии удалены: %d" % removed)
+            notify_user("Antigravity: патч переприменён",
+                        ", ".join(changed_any))
+
+        state["failures"] = failures
+        state["last"] = {
+            "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "ok": rc == 0,
+            "message": ("пропатчено: " + ", ".join(changed_any)) if changed_any
+                       else ("уже пропатчено" if rc == 0 else "есть проблемы, см. журнал"),
+        }
+        save_autopatch_state(state)
+        return rc
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def cmd_autopatch(args: argparse.Namespace) -> int:
+    actions = {
+        "install": autopatch_install,
+        "uninstall": autopatch_uninstall,
+        "status": autopatch_status,
+        "run": autopatch_run,
+    }
+    return actions[args.action](args)
+
+
 def resolve(args: argparse.Namespace) -> List[Path]:
     if getattr(args, "path", None):
         return [Path(p).expanduser() for p in args.path]
@@ -1610,6 +2070,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help="записать рабочую модель в settings.json (с резервной копией)")
     d.add_argument("--settings", metavar="FILE", help="путь к settings.json")
 
+    ap = sub.add_parser(
+        "autopatch",
+        help="патчить автоматически после обновления agy (systemd --user)")
+    ap.add_argument("action", choices=["install", "uninstall", "status", "run"],
+                    help="install — включить, uninstall — выключить, "
+                         "status — показать, run — выполнить проверку сейчас")
+    ap.add_argument("--interval", type=int, default=10,
+                    help="периодическая проверка, минуты; 0 — только по событию "
+                         "(по умолчанию 10)")
+    ap.add_argument("--verbose", action="store_true",
+                    help="для run: писать в журнал и успешные проверки")
+
     return p
 
 
@@ -1626,6 +2098,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "gates": cmd_gates,
         "test": cmd_test,
         "doctor": cmd_doctor,
+        "autopatch": cmd_autopatch,
     }
     handler = handlers[args.command]
     if args.command in ("patch", "restore"):

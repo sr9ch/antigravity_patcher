@@ -5,6 +5,7 @@ import os
 import shutil
 import struct
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -327,6 +328,115 @@ class MacSignCommandTests(unittest.TestCase):
         self.assertNotIn("--deep", sign)
         self.assertNotIn("--options=0", sign)
         self.assertTrue(any(a.startswith("--preserve-metadata") for a in sign))
+
+
+class AutopatchUnitTests(unittest.TestCase):
+    """Юниты systemd генерируются как текст — проверяем содержимое."""
+
+    def test_service_runs_runner(self):
+        text = fix.render_service_unit(Path("/tmp/run me.sh"))
+        self.assertIn("Type=oneshot", text)
+        self.assertIn('ExecStart="/tmp/run me.sh"', text)
+
+    def test_path_unit_watches_every_target(self):
+        targets = [Path("/home/u/.local/bin/agy"), Path("/home/u/my agy/agy")]
+        text = fix.render_path_unit(targets)
+        self.assertIn("PathChanged=/home/u/.local/bin/agy", text)
+        self.assertIn('PathModified="/home/u/my agy/agy"', text)
+        self.assertIn("Unit=%s" % fix.AUTOPATCH_SERVICE, text)
+        self.assertIn("WantedBy=paths.target", text)
+
+    def test_timer_interval_and_event_only(self):
+        text = fix.render_timer_unit(10)
+        self.assertIn("OnUnitActiveSec=10min", text)
+        self.assertIn("OnBootSec=2min", text)
+        self.assertIn("WantedBy=timers.target", text)
+        self.assertNotIn("OnUnitActiveSec", fix.render_timer_unit(0))
+
+    def test_percent_escaped_for_systemd(self):
+        self.assertEqual(fix._sd_quote("/tmp/100%"), '"/tmp/100%%"')
+
+    def test_install_refuses_on_macos(self):
+        tmp = Path(tempfile.mkdtemp(prefix="agy-units-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        ns = type("A", (), {"interval": 10, "path": None, "all": False, "app": False})()
+        with mock.patch.object(fix.sys, "platform", "darwin"), \
+             mock.patch.object(fix, "resolve", lambda a: [Path("/tmp/agy")]), \
+             mock.patch.object(fix, "systemd_user_dir", lambda: tmp):
+            self.assertEqual(fix.autopatch_install(ns), 2)
+        self.assertEqual(list(tmp.iterdir()), [])
+
+    def test_runner_calls_autopatch_run(self):
+        text = fix.render_runner(Path("/repo/agy_region_fix.py"), "/usr/bin/python3")
+        self.assertIn("/usr/bin/python3", text)
+        self.assertIn("/repo/agy_region_fix.py", text)
+        self.assertTrue(text.strip().endswith("agy_region_fix.py autopatch run"))
+
+
+class AutopatchRunTests(unittest.TestCase):
+    """Логика `autopatch run`: что патчится и когда приходит уведомление."""
+
+    class _Insp:
+        def __init__(self, overall):
+            self.overall = overall
+            self.version = "9.9.9"
+            self.arch = "x64"
+            self.sha256 = "deadbeef" * 8
+            gate = type("G", (), {"gate": type("Gate", (), {"key": "cli"})()})()
+            self.present = [] if overall == "unsupported" else [gate]
+            self.broken = [gate] if overall == "broken" else []
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="agy-autopatch-"))
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.target = self.dir / "agy"
+        self.target.write_bytes(b"\x7fELF" + b"\x00" * 32)
+        self.notified = []
+        self.patched = []
+        self.saved = {}
+
+    def _run(self, overall, state=None):
+        state = state if state is not None else {"targets": [str(self.target)], "failures": {}}
+        ns = type("A", (), {"verbose": False, "path": None, "all": False, "app": False})()
+        with mock.patch.object(fix, "load_autopatch_state", return_value=state), \
+             mock.patch.object(fix, "save_autopatch_state",
+                               side_effect=lambda s: self.saved.update(s)), \
+             mock.patch.object(fix, "autopatch_log", lambda m: None), \
+             mock.patch.object(fix, "notify_user",
+                               side_effect=lambda t, b: self.notified.append(b)), \
+             mock.patch.object(fix, "wait_until_stable", lambda p, **kw: True), \
+             mock.patch.object(fix, "inspect", lambda p: self._Insp(overall)), \
+             mock.patch.object(fix, "patch_one",
+                               side_effect=lambda p, a: (self.patched.append((p, a)), 0)[1]), \
+             mock.patch.object(fix, "prune_backups", lambda keep: (0, 1)):
+            rc = fix.autopatch_run(ns)
+        return rc
+
+    def test_original_is_patched_with_force(self):
+        rc = self._run("original")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.patched), 1)
+        self.assertTrue(self.patched[0][1].force)
+        self.assertIn("пропатчено", self.saved["last"]["message"])
+
+    def test_patched_is_noop(self):
+        rc = self._run("patched")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.patched, [])
+
+    def test_unsupported_notifies_once(self):
+        state = {"targets": [str(self.target)], "failures": {}}
+        self.assertEqual(self._run("unsupported", state), 2)
+        self.assertEqual(len(self.notified), 1)
+        self.assertEqual(self.patched, [])
+        # второй запуск с тем же sha не спамит
+        self._run("unsupported", state)
+        self.assertEqual(len(self.notified), 1)
+
+    def test_broken_is_not_written(self):
+        self.assertEqual(self._run("broken"), 2)
+        self.assertEqual(self.patched, [])
+        self.assertEqual(len(self.notified), 1)
 
 
 if __name__ == "__main__":
