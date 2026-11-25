@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 antigravity-region-fix — адресный патч локального гейта доступности
-Antigravity CLI (agy) и бэкендов Antigravity для Linux и macOS.
+Antigravity CLI (agy) и бэкендов Antigravity для Linux, macOS и Windows.
 
 Что делает:
   * находит установленный agy и определяет его версию/архитектуру;
-  * проверяет, что бинарник — ELF или Mach-O (в т.ч. universal) известной
+  * проверяет, что бинарник — ELF, PE32+ или Mach-O (в т.ч. universal) известной
     архитектуры, и что сигнатуры гейтов уникальны (0 совпадений или >1 —
     отказ без записи);
   * сохраняет проверенную резервную копию оригинала;
@@ -25,7 +25,6 @@ Antigravity CLI (agy) и бэкендов Antigravity для Linux и macOS.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import json
 import os
@@ -37,12 +36,17 @@ import subprocess
 import sys
 import tempfile
 import time
+
+try:                       # POSIX; на Windows используем msvcrt
+    import fcntl
+except ImportError:        # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 TOOL = "antigravity-region-fix"
-TOOL_VERSION = "1.3.0"
+TOOL_VERSION = "1.5.0"
 MANIFEST_SCHEMA = 1
 
 # --------------------------------------------------------------------------
@@ -53,6 +57,11 @@ EM_X86_64 = 0x3E
 EM_AARCH64 = 0xB7
 PT_LOAD = 1
 PF_X = 0x1
+
+PE32_PLUS_MAGIC = 0x20B
+PE_AMD64 = 0x8664
+PE_ARM64 = 0xAA64
+IMAGE_SCN_MEM_EXECUTE = 0x20000000
 
 MH_MAGIC_64 = 0xFEEDFACF
 MH_CIGAM_64 = 0xCFFAEDFE
@@ -129,6 +138,50 @@ def parse_elf(data: bytes) -> ElfInfo:
 
 
 @dataclass(frozen=True)
+class PeInfo:
+    machine: int
+    image_base: int
+    exec_ranges: List[Tuple[int, int]]
+
+
+def parse_pe(data: bytes) -> PeInfo:
+    """Разбирает PE32+ (Windows x64/arm64) и возвращает файловые диапазоны кода."""
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        raise UnsupportedBinary("не PE: нет сигнатуры MZ")
+    e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
+    if e_lfanew + 24 > len(data) or data[e_lfanew:e_lfanew + 4] != b"PE\0\0":
+        raise UnsupportedBinary("повреждён PE-заголовок")
+    coff = e_lfanew + 4
+    machine, nsec = struct.unpack_from("<HH", data, coff)
+    opt_size = struct.unpack_from("<H", data, coff + 16)[0]
+    opt = coff + 20
+    if opt + 24 > len(data):
+        raise UnsupportedBinary("обрезанный optional header PE")
+    magic = struct.unpack_from("<H", data, opt)[0]
+    if magic != PE32_PLUS_MAGIC:
+        raise UnsupportedBinary("ожидался PE32+ (64-бит), magic 0x%x" % magic)
+    image_base = struct.unpack_from("<Q", data, opt + 24)[0]
+
+    so = opt + opt_size
+    if nsec <= 0 or nsec > 96 or so + nsec * 40 > len(data):
+        raise UnsupportedBinary("некорректная таблица секций PE")
+    ranges: List[Tuple[int, int]] = []
+    for i in range(nsec):
+        hdr = so + i * 40
+        chars = struct.unpack_from("<I", data, hdr + 36)[0]
+        _vsize, _vaddr, raw_size, raw_ptr = struct.unpack_from("<IIII", data, hdr + 8)
+        if not (chars & IMAGE_SCN_MEM_EXECUTE) or raw_size == 0:
+            continue
+        start = raw_ptr
+        end = min(raw_ptr + raw_size, len(data))
+        if 0 <= start < end:
+            ranges.append((start, end))
+    if not ranges:
+        raise UnsupportedBinary("в PE нет исполняемых секций")
+    return PeInfo(machine=machine, image_base=image_base, exec_ranges=ranges)
+
+
+@dataclass(frozen=True)
 class Slice:
     """Один код-слайс: ELF целиком или одна архитектура внутри universal."""
     arch: str
@@ -139,7 +192,7 @@ class Slice:
 
 @dataclass(frozen=True)
 class BinaryInfo:
-    kind: str                       # "elf" | "macho"
+    kind: str                       # "elf" | "pe" | "macho"
     slices: Tuple[Slice, ...]
 
     @property
@@ -166,6 +219,14 @@ def _arch_from_machine(machine: int) -> str:
     if machine == EM_X86_64:
         return "x64"
     if machine == EM_AARCH64:
+        return "arm64"
+    return "unknown:0x%x" % machine
+
+
+def _arch_from_pe_machine(machine: int) -> str:
+    if machine == PE_AMD64:
+        return "x64"
+    if machine == PE_ARM64:
         return "arm64"
     return "unknown:0x%x" % machine
 
@@ -255,11 +316,17 @@ def parse_binary(data: bytes) -> BinaryInfo:
                    base=0, size=len(data))
         return BinaryInfo(kind="elf", slices=(sl,))
 
+    if data[:2] == b"MZ":
+        pe = parse_pe(data)
+        sl = Slice(arch=_arch_from_pe_machine(pe.machine), ranges=pe.exec_ranges,
+                   base=0, size=len(data))
+        return BinaryInfo(kind="pe", slices=(sl,))
+
     macho = _parse_macho(data)
     if macho is not None:
         return macho
 
-    raise UnsupportedBinary("неизвестный формат: ожидался ELF или Mach-O")
+    raise UnsupportedBinary("неизвестный формат: ожидался ELF, PE или Mach-O")
 
 
 # --------------------------------------------------------------------------
@@ -380,7 +447,7 @@ GATES: Tuple[Gate, ...] = (
         ],
         fix=b"\x48\x85\xc9\x90",
         fix_offset=9,
-        note="проверено на 1.5.13 и 1.5.14",
+        note="проверено на 1.5.13–1.5.17 (Linux) и 1.5.17 (Windows PE)",
     ),
     Gate(
         key="hub",
@@ -396,7 +463,7 @@ GATES: Tuple[Gate, ...] = (
         ],
         fix=b"\xc6\x40\x08\x01\x90\x90",
         fix_offset=0,
-        note="проверено на 1.5.13, 1.5.14 и бэкенде IDE 1.5.2",
+        note="проверено на 1.5.13–1.5.17 (Linux), IDE 1.5.2 и Windows 1.5.17",
     ),
     Gate(
         key="cli-arm64",
@@ -418,9 +485,9 @@ GATES: Tuple[Gate, ...] = (
         ],
         fix=b"\x22\x00\x80\x52",
         fix_offset=0,
-        verified=False,
+        verified=True,
         accept=_cli_arm64_context,
-        note="сигнатура upstream, на этой машине (x86-64) не проверялась",
+        note="найдено в Windows arm64 1.5.17; запуск на arm64 не проверялся",
     ),
     Gate(
         key="hub-arm64",
@@ -438,8 +505,8 @@ GATES: Tuple[Gate, ...] = (
         ],
         fix=b"\x23\x00\x80\x52\x03\x20\x00\x39",
         fix_offset=0,
-        verified=False,
-        note="сигнатура upstream, на этой машине (x86-64) не проверялась",
+        verified=True,
+        note="найдено в Windows arm64 1.5.17; запуск на arm64 не проверялся",
     ),
 )
 
@@ -542,7 +609,12 @@ def sha256_file(path: Path, chunk: int = 8 * 1024 * 1024) -> str:
 
 
 def state_dir() -> Path:
-    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    base = os.environ.get("XDG_DATA_HOME")
+    if not base:
+        if os.name == "nt":
+            base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/.local/share")
+        else:
+            base = os.path.expanduser("~/.local/share")
     path = Path(base) / TOOL
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -602,6 +674,12 @@ def write_target(path: Path, data: bytes, mode: int) -> None:
     try:
         atomic_write(path, data, mode)
     except PermissionError as exc:
+        if os.name == "nt":
+            raise PatchError(
+                "Windows блокирует запись в %s: файл занят (agy запущен?) или его "
+                "держит антивирус.\nЗакройте CLI/приложение и повторите; если файл "
+                "только что обновился — подождите несколько секунд." % path
+            ) from exc
         raise PatchError(_macos_write_hint(path, exc)) from exc
 
 
@@ -670,6 +748,9 @@ def _version_from_asar(binary: Path) -> Optional[str]:
         return None
 
 
+CLI_NAMES = {"agy", "agy.exe", "antigravity", "antigravity.exe"}
+
+
 def detect_version(path: Path, data: Optional[bytes] = None) -> str:
     """Версия из sibling-манифеста установщика, asar приложения, иначе `--version`."""
     sidecar = path.parent / (path.name + ".version.json")
@@ -685,7 +766,7 @@ def detect_version(path: Path, data: Optional[bytes] = None) -> str:
     if from_asar:
         return from_asar
 
-    if path.name != "agy":
+    if path.name not in CLI_NAMES:
         # language_server и прочие бэкенды не понимают `-p`/`--version`
         return "unknown"
 
@@ -744,6 +825,18 @@ def default_targets(all_targets: bool, include_apps: bool = False) -> List[Path]
     if sys.platform == "darwin":
         candidates.append(Path("/usr/local/bin/agy"))
         candidates.append(Path("/opt/homebrew/bin/agy"))
+    if os.name == "nt":
+        candidates.extend([
+            home / ".local" / "bin" / "agy.exe",
+            home / ".local" / "bin" / "antigravity.exe",
+            home / ".gemini" / "bin" / "agy.exe",
+            home / "AppData" / "Local" / "Programs" / "antigravity" / "antigravity.exe",
+            home / "AppData" / "Local" / "Programs" / "Antigravity" / "antigravity.exe",
+            home / "AppData" / "Local" / "agy" / "agy.exe",
+        ])
+        extra = shutil.which("antigravity")
+        if extra:
+            candidates.append(Path(extra))
     if all_targets or include_apps:
         candidates.extend(app_targets())
     out: List[Path] = []
@@ -1108,6 +1201,13 @@ def patch_one(path: Path, args: argparse.Namespace) -> int:
 
     ensure_writable(path)
 
+    # Файл мог быть заменён автообновлением между чтением и записью:
+    # пишем только если на диске всё ещё те же байты, что мы проверили.
+    if sha256_file(path) != insp.sha256:
+        err("%s изменился во время проверки (похоже на автообновление). "
+            "Повторите patch." % path)
+        return 2
+
     data = bytearray(insp.data)
     changed = apply_gates(data, insp.relevant_gates)
     if not changed:
@@ -1304,7 +1404,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             print("  резервная копия: %s (версия %s)" % (backup, meta.get("version")))
         except PatchError:
             print("  резервная копия: %s" % _c("нет", "33"))
-        if not insp.arch.startswith("x64"):
+        if any(not g.verified for g in GATES if g.arch == insp.arch):
             warn("для %s сигнатуры помечены как непроверенные" % insp.arch)
     print()
     return 0
@@ -1738,6 +1838,8 @@ def wait_until_stable(path: Path, timeout: float = 20.0, settle: float = 1.0) ->
 
 
 def autopatch_install(args: argparse.Namespace) -> int:
+    if os.name == "nt":
+        return autopatch_install_windows(args)
     if sys.platform == "darwin":
         err("autopatch ставит юниты systemd --user, а на macOS его нет")
         print("на macOS используйте cron или launchd с той же командой:")
@@ -1800,7 +1902,94 @@ def autopatch_install(args: argparse.Namespace) -> int:
     return 0
 
 
+AUTOPATCH_TASK = "AntigravityRegionFix"
+
+
+def autopatch_runner_win() -> Path:
+    return state_dir() / "autopatch-run.cmd"
+
+
+def render_runner_cmd(module: Path, python: str) -> str:
+    return "@echo off\r\n\"%s\" \"%s\" autopatch run\r\n" % (python, module)
+
+
+def _schtasks(*args: str) -> Tuple[int, str]:
+    if os.name != "nt":
+        return 127, "schtasks доступен только на Windows"
+    exe = shutil.which("schtasks") or "schtasks"
+    try:
+        proc = subprocess.run([exe, *args], check=False, timeout=60,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, str(exc)
+    return proc.returncode, proc.stdout.decode("utf-8", "replace").strip()
+
+
+def autopatch_install_windows(args: argparse.Namespace) -> int:
+    targets = resolve(args)
+    if not targets:
+        err("agy не найден — нечего автоматически патчить")
+        return 2
+    interval = max(1, args.interval or 10)
+    runner = autopatch_runner_win()
+    atomic_write(runner, render_runner_cmd(Path(__file__).resolve(), sys.executable)
+                 .encode("utf-8"), 0o644)
+
+    rc, out = _schtasks("/Create", "/F", "/SC", "MINUTE", "/MO", str(interval),
+                        "/TN", AUTOPATCH_TASK, "/TR", str(runner))
+    if rc != 0:
+        err("не удалось создать задачу в Планировщике: %s" % out)
+        err("включите вручную: schtasks /Create /F /SC MINUTE /MO %d /TN %s /TR \"%s\"" %
+            (interval, AUTOPATCH_TASK, runner))
+        return 2
+    rc2, out2 = _schtasks("/Run", "/TN", AUTOPATCH_TASK)
+    if rc2 != 0:
+        warn("задача создана, но первый запуск не стартовал: %s" % out2)
+
+    state = {
+        "installed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "targets": [str(t) for t in targets],
+        "interval_minutes": interval,
+        "module": str(Path(__file__).resolve()),
+        "python": sys.executable,
+        "backend": "schtasks",
+        "task": AUTOPATCH_TASK,
+        "failures": {},
+    }
+    save_autopatch_state(state)
+    autopatch_log("установлен автопатч (Планировщик Windows): %s" %
+                  ", ".join(str(t) for t in targets))
+
+    ok("автопатч включён: задача %s каждые %d мин" % (AUTOPATCH_TASK, interval))
+    print("  цели:    %s" % ", ".join(str(t) for t in targets))
+    print("  журнал:  %s" % autopatch_log_file())
+    print("  статус:  %s autopatch status" % self_hint())
+    return 0
+
+
+def autopatch_uninstall_windows(args: argparse.Namespace) -> int:
+    rc, out = _schtasks("/Delete", "/TN", AUTOPATCH_TASK, "/F")
+    if rc != 0:
+        warn("задача не удалена: %s" % out)
+    runner = autopatch_runner_win()
+    if runner.exists():
+        try:
+            runner.unlink()
+        except OSError:
+            pass
+    try:
+        autopatch_record().unlink()
+    except OSError:
+        pass
+    autopatch_log("автопатч выключен")
+    ok("автопатч выключен")
+    print("патч в бинарнике остался; снять его: %s restore" % self_hint())
+    return 0
+
+
 def autopatch_uninstall(args: argparse.Namespace) -> int:
+    if os.name == "nt":
+        return autopatch_uninstall_windows(args)
     unit_dir = systemd_user_dir()
     for unit in (AUTOPATCH_PATH_UNIT, AUTOPATCH_TIMER):
         _systemctl("disable", "--now", unit)
@@ -1831,8 +2020,64 @@ def autopatch_uninstall(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_autopatch_targets(state: Dict[str, object]) -> None:
+    targets = [Path(t) for t in (state.get("targets") or [])]
+    if not targets:
+        return
+    print()
+    print("цели:")
+    for target in targets:
+        if not target.exists():
+            print("  %s — файла нет" % target)
+            continue
+        try:
+            insp = inspect(target)
+        except PatchError as exc:
+            print("  %s — %s" % (target, exc))
+            continue
+        label = {
+            "patched": "пропатчен",
+            "original": _c("не пропатчен", "33"),
+            "partial": _c("частично", "33"),
+            "broken": _c("повреждён", "31"),
+            "unsupported": _c("сигнатуры не найдены", "31"),
+        }.get(insp.overall, insp.overall)
+        print("  %s — %s %s" % (target, insp.version, label))
+
+
+def _print_autopatch_tail(state: Dict[str, object]) -> None:
+    record = state.get("last") if isinstance(state.get("last"), dict) else None
+    if record:
+        print()
+        print("последний запуск: %s — %s" % (record.get("at"), record.get("message")))
+
+    log = autopatch_log_file()
+    if log.is_file():
+        lines = log.read_text("utf-8", "replace").strip().splitlines()
+        if lines:
+            print()
+            print("журнал (%s), последние строки:" % log)
+            for line in lines[-6:]:
+                print("  %s" % line)
+
+
 def autopatch_status(args: argparse.Namespace) -> int:
     state = load_autopatch_state()
+    if os.name == "nt":
+        rc, _out = _schtasks("/Query", "/TN", AUTOPATCH_TASK)
+        installed = rc == 0
+        print("автопатч: %s (задача Планировщика %s)" %
+              ("установлен" if installed else "не установлен", AUTOPATCH_TASK))
+        if state.get("installed_at"):
+            print("  установлен: %s" % state.get("installed_at"))
+        if installed and state.get("interval_minutes"):
+            print("  период:     каждые %s мин" % state.get("interval_minutes"))
+        _print_autopatch_targets(state)
+        _print_autopatch_tail(state)
+        if not installed:
+            print("включить: %s autopatch install" % self_hint())
+        return 0
+
     unit_dir = systemd_user_dir()
     installed = any((unit_dir / n).is_file() for n in
                     (AUTOPATCH_SERVICE, AUTOPATCH_PATH_UNIT, AUTOPATCH_TIMER))
@@ -1849,50 +2094,19 @@ def autopatch_status(args: argparse.Namespace) -> int:
         _, active = _systemctl("is-active", unit)
         print("  %-34s %s / %s" % (unit, enabled or "?", active or "?"))
 
-    targets = [Path(t) for t in (state.get("targets") or [])]
-    if targets:
-        print()
-        print("цели:")
-        for target in targets:
-            if not target.exists():
-                print("  %s — файла нет" % target)
-                continue
-            try:
-                insp = inspect(target)
-            except PatchError as exc:
-                print("  %s — %s" % (target, exc))
-                continue
-            label = {
-                "patched": "пропатчен",
-                "original": _c("не пропатчен", "33"),
-                "partial": _c("частично", "33"),
-                "broken": _c("повреждён", "31"),
-                "unsupported": _c("сигнатуры не найдены", "31"),
-            }.get(insp.overall, insp.overall)
-            print("  %s — %s %s" % (target, insp.version, label))
-
-    record = state.get("last") if isinstance(state.get("last"), dict) else None
-    if record:
-        print()
-        print("последний запуск: %s — %s" % (record.get("at"), record.get("message")))
-
-    log = autopatch_log_file()
-    if log.is_file():
-        lines = log.read_text("utf-8", "replace").strip().splitlines()
-        if lines:
-            print()
-            print("журнал (%s), последние строки:" % log)
-            for line in lines[-6:]:
-                print("  %s" % line)
+    _print_autopatch_targets(state)
+    _print_autopatch_tail(state)
     return 0
 
 
 def autopatch_run(args: argparse.Namespace) -> int:
     lock_path = state_dir() / ".lock"
-    handle = open(lock_path, "w")
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        handle = open(lock_path, "w")
     except OSError:
+        autopatch_log("пропуск: не удалось открыть lock-файл %s" % lock_path)
+        return 0
+    if not try_lock(handle):
         handle.close()
         autopatch_log("пропуск: другой экземпляр уже работает")
         return 0
@@ -1982,10 +2196,8 @@ def autopatch_run(args: argparse.Namespace) -> int:
         save_autopatch_state(state)
         return rc
     finally:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        finally:
-            handle.close()
+        unlock_file(handle)
+        handle.close()
 
 
 def cmd_autopatch(args: argparse.Namespace) -> int:
@@ -2008,23 +2220,55 @@ def resolve(args: argparse.Namespace) -> List[Path]:
 # main
 # --------------------------------------------------------------------------
 
+def try_lock(fh) -> bool:
+    """Неблокирующая блокировка файла (POSIX flock / Windows msvcrt)."""
+    if fcntl is not None:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+    try:
+        import msvcrt
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        return True
+    except OSError:
+        return False
+
+
+def unlock_file(fh) -> None:
+    try:
+        if fcntl is not None:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        else:
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+
+
 class _Lock:
     def __init__(self) -> None:
         self.path = state_dir() / ".lock"
         self.fh = None
 
     def __enter__(self) -> "_Lock":
-        self.fh = open(self.path, "w")
         try:
-            fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.fh = open(self.path, "w")
         except OSError:
+            err("не удалось открыть lock-файл %s" % self.path)
+            raise SystemExit(3)
+        if not try_lock(self.fh):
             err("другой экземпляр %s уже работает" % TOOL)
+            self.fh.close()
             raise SystemExit(3)
         return self
 
     def __exit__(self, *exc: object) -> None:
         if self.fh:
-            fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
+            unlock_file(self.fh)
             self.fh.close()
 
 

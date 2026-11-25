@@ -1,13 +1,16 @@
 # antigravity-region-fix
 
 Локальный патч регионального гейта **Antigravity CLI (`agy`)** и бэкендов
-Antigravity для Linux и macOS. Позволяет использовать уже авторизованный
+Antigravity для Linux, macOS и Windows. Позволяет использовать уже авторизованный
 Google-аккаунт без VPN, прокси, смены DNS и смены региона аккаунта.
 
-Проверено на `agy 1.5.13`, `1.5.14` и `1.5.16`, Fedora Linux 45, x86-64,
-аккаунт с обычной consumer-авторизацией. Поддержка macOS (Mach-O, включая
+Проверено на `agy 1.5.13`–`1.5.17`, Fedora Linux 45, x86-64, аккаунт с
+обычной consumer-авторизацией. Поддержка macOS (Mach-O, включая
 universal-бинарники) реализована и покрыта юнит-тестами, но на реальном Mac
-ещё не прогонялась — см. раздел 3.1.
+ещё не прогонялась — см. раздел 3.1. Windows (PE32+ x64 и arm64) проверен на
+официальных сборках 1.5.17 из GitHub Releases: сигнатуры найдены и патч
+применяется, но запуск пропатченного `.exe` на Windows не проверялся — см.
+раздел 3.2.
 
 ## Установка
 
@@ -271,8 +274,9 @@ codesign --force --deep --sign - --options=0 /Applications/Antigravity.app
 подтверждает, что код пришёл от Google. Это неизбежно при изменении
 подписанного бинарника.
 
-**Проверка сигнатур на Mac.** arm64-сигнатуры взяты из upstream и на этой
-машине (Linux x86-64) не проверялись. Первый запуск на Mac:
+**Проверка сигнатур на Mac.** arm64-сигнатуры взяты из upstream, а затем
+подтверждены на официальной Windows arm64-сборке 1.5.17 (PE). На реальном
+Apple Silicon запуск всё ещё не проверялся. Первый запуск на Mac:
 
 ```bash
 ./agy-region-fix --path /Applications/Antigravity.app/Contents/Resources/bin/language_server status
@@ -288,6 +292,57 @@ iOS/macOS-специфика: `agy` для macOS ставится тем же у
 перезаписывает бинарник и снимает патч так же, как на Linux; после обновления
 повторите `./agy-region-fix patch`.
 
+### 3.2 Windows
+
+Поддерживается PE32+ (x64 и arm64). Нужен только Python 3.8+ с python.org,
+без сторонних пакетов:
+
+```powershell
+cd путь\к\antigravity_patcher
+
+py agy_region_fix.py status     # версия, архитектура, контейнер, состояние
+py agy_region_fix.py patch
+py agy_region_fix.py verify
+py agy_region_fix.py restore
+```
+
+Если `agy` не находится в PATH, укажите путь явно (`.exe` обязателен):
+
+```powershell
+py agy_region_fix.py --path "$env:USERPROFILE\.local\bin\agy.exe" status
+py agy_region_fix.py --path "C:\Tools\Antigravity\antigravity.exe" patch
+```
+
+Что проверено на официальной сборке 1.5.17 (`agy_cli_windows_x64.zip` и
+`agy_cli_windows_arm64.zip` с GitHub Releases):
+
+* обе сигнатуры (`cli`, `hub`) находятся **ровно по одному разу** и в x64,
+  и в arm64;
+* патч меняет те же 4 и 6 байт, после чего `verify` видит `patched`;
+* версия определяется запуском `antigravity.exe --version` (на Windows это
+  работает; при осмотре PE-файла с Linux версия будет `unknown`).
+
+Чего в Windows-сборке нет и что важно знать:
+
+* **Файл блокируется, пока `agy` запущен.** Windows не даст заменить
+  работающий `.exe`: патчер вернёт понятную ошибку «файл занят». Закройте CLI
+  и повторите (автопатч сам повторит позже).
+* **Подпись Google перестаёт действовать.** Официальный `.exe` подписан
+  Authenticode; после правки подпись невалидна. Windows запускает такой файл,
+  но SmartScreen/Defender могут показать предупреждение о неизвестном
+  издателе. Это неизбежно: переподписать без сертификата Google нельзя.
+* **Бэкап** — тот же `.orig` + JSON в `%LOCALAPPDATA%\antigravity-region-fix\backups\`.
+* После автообновления CLI файл заменяется целиком, патч исчезает — как и на
+  других платформах, см. раздел 5.
+
+Автопатч на Windows ставится задачей Планировщика (см. 5.1):
+
+```powershell
+py agy_region_fix.py autopatch install
+py agy_region_fix.py autopatch status
+py agy_region_fix.py autopatch uninstall
+```
+
 ---
 
 ## 4. Гарантии безопасности
@@ -295,7 +350,8 @@ iOS/macOS-специфика: `agy` для macOS ставится тем же у
 * **Резервная копия** кладётся в
   `~/.local/share/antigravity-region-fix/backups/agy-<версия>-<sha12>.orig`
   вместе с JSON-манифестом (sha256, размер, версия, архитектура, дата).
-* **Проверка сигнатур** — только в исполняемых PT_LOAD-сегментах. Патч
+* **Проверка сигнатур** — только в исполняемых PT_LOAD-сегментах ELF,
+  секциях Mach-O с `VM_PROT_EXECUTE` и PE-секциях с `IMAGE_SCN_MEM_EXECUTE`. Патч
   применяется, если сигнатура найдена **ровно один раз**. Ноль, два и более
   совпадений, а также смешанное состояние «частично пропатчено» → отказ без записи.
 * **Защита от повторного применения** — повторный `patch` сообщает
@@ -359,6 +415,14 @@ systemd:
 
 Если хочется совсем без systemd — тот же `autopatch run` можно вызывать из
 cron (`*/10 * * * *`) или из своей обёртки; разницы в поведении нет.
+
+**Windows:** `autopatch install` создаёт задачу Планировщика
+`AntigravityRegionFix`, которая каждые 10 минут (или `--interval N`) запускает
+`autopatch run` через сгенерированный `autopatch-run.cmd`. Проверить:
+`schtasks /Query /TN AntigravityRegionFix`. Событийного inotify там нет, так
+что периодический запуск — основной механизм; патч применяется в течение
+10 минут после обновления, а если CLI в этот момент запущен — при следующем
+запуске задачи, когда файл уже свободен.
 
 **macOS:** systemd там нет, поэтому `autopatch install` рассчитан на Linux.
 На Mac используйте тот же `autopatch run` из `launchd` (StartInterval 600)
@@ -435,11 +499,12 @@ antigravity_patcher/
 ├── NOTICE                      # атрибуция upstream
 ├── README.md
 ├── ci/github-actions-tests.yml # готовый CI (включается вручную, см. шапку файла)
-└── tests/test_patcher.py       # 34 юнит-теста
+└── tests/test_patcher.py       # 42 юнит-теста
 
 ~/.local/share/antigravity-region-fix/
 ├── backups/<имя>-<версия>-<sha12>.orig (+ .json)
 ├── autopatch-run.sh    # обёртка для systemd (генерируется)
+├── autopatch-run.cmd   # обёртка для Планировщика Windows
 ├── autopatch.json      # цели и результат последнего запуска
 └── autopatch.log       # журнал автопатча
 
@@ -489,6 +554,9 @@ tail -40 ~/.gemini/antigravity-cli/log/cli-*.log
 | `patch` вернул **2**, «ambiguous/mixed» | остатки прошлого патча или нестандартная сборка | `./agy-region-fix restore`, затем `patch`; если повтор — переустановите `agy` |
 | `patch` вернул **3** | `agy` запущен | закройте CLI/IDE/приложение, повторите |
 | «нет прав на запись» | файл принадлежит root | `sudo ./agy-region-fix patch` или исправьте владельца |
+| Windows: «файл занят», запись не идёт | запущен `agy.exe`, файл заблокирован ОС | закройте CLI; автопатч повторит сам |
+| Windows: SmartScreen «неизвестный издатель» | подпись Google аннулирована патчем | это ожидаемо; запускайте файл, который сами пропатчили |
+| Windows: `status` показывает версию `unknown` | PE осматривается с Linux или имя файла не `agy.exe`/`antigravity.exe` | на Windows версия берётся из `--version`; для копии это нормально |
 | Патч применён, но снова ошибка региона | пропатчен не тот файл | `which agy` и `./agy-region-fix status`; сверьте путь |
 | После обновления CLI всё сломалось | автообновление вернуло оригинал | есть автопатч: `autopatch status`; иначе `./agy-region-fix verify` → `patch` |
 | Автопатч не сработал | юнит не включён / файл вне списка целей | `./agy-region-fix autopatch status`, затем `autopatch install` заново |
@@ -732,5 +800,6 @@ tail -50 ~/.gemini/antigravity-cli/log/cli-*.log
   в этом проекте.
 * Официальное: [google-antigravity/antigravity-cli](https://github.com/google-antigravity/antigravity-cli),
   [antigravity.google/docs](https://antigravity.google/docs/).
-* Версии, на которых сверены сигнатуры: CLI 1.5.13, 1.5.14, 1.5.16 (Linux x86-64);
+* Версии, на которых сверены сигнатуры: CLI 1.5.13–1.5.17 (Linux x86-64),
+  1.5.17 (Windows PE x64 и arm64);
   бэкенд IDE 1.5.2; приложение 2.29.0 (language_server).

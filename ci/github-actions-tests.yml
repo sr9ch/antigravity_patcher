@@ -41,3 +41,19 @@ jobs:
         run: |
           ./agy-region-fix --version
           ./agy-region-fix gates
+
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Синтаксис
+        run: python -m py_compile agy_region_fix.py tests/test_patcher.py
+      - name: Юнит-тесты
+        run: python tests/test_patcher.py
+      - name: CLI отвечает
+        run: |
+          python agy_region_fix.py --version
+          python agy_region_fix.py gates

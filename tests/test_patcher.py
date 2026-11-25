@@ -398,7 +398,8 @@ class AutopatchRunTests(unittest.TestCase):
     def _run(self, overall, state=None):
         state = state if state is not None else {"targets": [str(self.target)], "failures": {}}
         ns = type("A", (), {"verbose": False, "path": None, "all": False, "app": False})()
-        with mock.patch.object(fix, "load_autopatch_state", return_value=state), \
+        with mock.patch.object(fix, "state_dir", lambda: self.dir), \
+             mock.patch.object(fix, "load_autopatch_state", return_value=state), \
              mock.patch.object(fix, "save_autopatch_state",
                                side_effect=lambda s: self.saved.update(s)), \
              mock.patch.object(fix, "autopatch_log", lambda m: None), \
@@ -437,6 +438,96 @@ class AutopatchRunTests(unittest.TestCase):
         self.assertEqual(self._run("broken"), 2)
         self.assertEqual(self.patched, [])
         self.assertEqual(len(self.notified), 1)
+
+
+
+# --------------------------------------------------------------------------
+# PE (Windows) — синтетические бинарники
+# --------------------------------------------------------------------------
+
+def pe32plus(machine=0x8664, chars=0x20000000, code=b"\x90" * 64) -> bytes:
+    dos = bytearray(0x40)
+    dos[0:2] = b"MZ"
+    struct.pack_into("<I", dos, 0x3C, 0x40)
+    coff = struct.pack("<HHIIIHH", machine, 1, 0, 0, 0, 0xF0, 0x22)
+    opt = bytearray(0xF0)
+    struct.pack_into("<H", opt, 0, 0x20B)
+    struct.pack_into("<Q", opt, 24, 0x140000000)
+    sec = bytearray(40)
+    sec[0:5] = b".text"
+    struct.pack_into("<IIII", sec, 8, len(code), 0x1000, len(code), 0x600)
+    struct.pack_into("<I", sec, 36, chars)
+    head = bytes(dos) + b"PE\0\0" + coff + bytes(opt) + bytes(sec)
+    return head + b"\x00" * (0x600 - len(head)) + code
+
+
+class PeTests(unittest.TestCase):
+    def test_parse_x64(self):
+        info = fix.parse_pe(pe32plus())
+        self.assertEqual(info.machine, 0x8664)
+        self.assertEqual(fix._arch_from_pe_machine(info.machine), "x64")
+        self.assertEqual(info.exec_ranges, [(0x600, 0x640)])
+        self.assertEqual(fix.parse_binary(pe32plus()).kind, "pe")
+
+    def test_parse_arm64(self):
+        info = fix.parse_pe(pe32plus(machine=0xAA64))
+        self.assertEqual(fix._arch_from_pe_machine(info.machine), "arm64")
+
+    def test_rejects_non_exec_section(self):
+        with self.assertRaises(fix.UnsupportedBinary):
+            fix.parse_pe(pe32plus(chars=0x40000040))
+
+    def test_rejects_bad_pe(self):
+        with self.assertRaises(fix.UnsupportedBinary):
+            fix.parse_pe(b"MZ" + b"\x00" * 200)
+
+    def test_rejects_non_pe64(self):
+        data = bytearray(pe32plus())
+        struct.pack_into("<H", data, 0x40 + 4 + 20, 0x10B)  # PE32
+        with self.assertRaises(fix.UnsupportedBinary):
+            fix.parse_pe(bytes(data))
+
+    def test_pe_gate_scan_and_patch(self):
+        data = pe32plus(code=b"\x00" * 32 + CLI_SIG + b"\x00" * 32 + HUB_SIG + b"\x00" * 32)
+        info = fix.parse_binary(data)
+        states = fix.scan_binary(info, data)
+        self.assertEqual({s.gate.key: s.state for s in states},
+                         {"cli": "original", "hub": "original"})
+        buf = bytearray(data)
+        changed = fix.apply_gates(buf, states)
+        self.assertEqual({s.gate.key for s in changed}, {"cli", "hub"})
+        self.assertEqual({s.state for s in fix.scan_binary(info, bytes(buf))}, {"patched"})
+
+
+class WindowsAutopatchTests(unittest.TestCase):
+    def test_runner_cmd(self):
+        text = fix.render_runner_cmd(Path("C:/tmp/agy_region_fix.py"), "C:/Python/python.exe")
+        self.assertTrue(text.startswith("@echo off\r\n"))
+        self.assertIn('"C:/Python/python.exe"', text)
+        self.assertIn("autopatch run", text)
+
+    def test_install_registers_scheduled_task(self):
+        tmp = Path(tempfile.mkdtemp(prefix="agy-win-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        calls = []
+        ns = type("A", (), {"interval": 7, "path": None, "all": False, "app": False})()
+        with mock.patch.object(fix, "resolve", lambda a: [tmp / "agy.exe"]), \
+             mock.patch.object(fix, "state_dir", lambda: tmp), \
+             mock.patch.object(fix, "save_autopatch_state", lambda s: calls.append(("state", s))), \
+             mock.patch.object(fix, "autopatch_log", lambda m: None), \
+             mock.patch.object(fix, "_schtasks",
+                               side_effect=lambda *a: (calls.append(("task", a)), (0, ""))[1]):
+            self.assertEqual(fix.autopatch_install_windows(ns), 0)
+        create = [c for c in calls if c[0] == "task"][0][1]
+        self.assertIn("/Create", create)
+        self.assertIn("/SC", create)
+        self.assertIn("MINUTE", create)
+        self.assertIn("7", create)
+        self.assertIn(fix.AUTOPATCH_TASK, create)
+        self.assertTrue((tmp / "autopatch-run.cmd").is_file())
+        state = [c for c in calls if c[0] == "state"][0][1]
+        self.assertEqual(state["backend"], "schtasks")
+        self.assertEqual(state["interval_minutes"], 7)
 
 
 if __name__ == "__main__":
